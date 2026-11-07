@@ -2720,6 +2720,56 @@ static double pcie_pool_k(double r) {
     return strata::pcie_pool_k(r, on);
 }
 
+// The GPU-only copy of the engine: the ring of the missed experts, once the verifier says how many entries a window holds.
+// `refuse`: why this run cannot take it.  The ring lives as long as the process.
+static strata::core::GpuMissRing g_gpu_ring;
+static void gpu_only_arm(strata::core::ExpertDispatch& d, const strata::core::GpuPlanSink* plan, const char* refuse,
+                         bool spec_split, int64_t n_layers, int64_t n_expert, bool unbuffered, int pcie_mode,
+                         strata::core::ExpertSource* src) {
+    if (!strata::core::gpu_only_misses()) {
+        std::fprintf(stderr, "strata serve: GPU-only misses off (STRATA_GPU_ONLY=0): the CPU computes the missed experts, as upstream\n");
+        return;
+    }
+    if (refuse != nullptr) {
+        strata::core::set_gpu_only_misses(false);
+        std::fprintf(stderr, "strata serve: GPU-only misses OFF: %s; the CPU computes the missed experts\n", refuse);
+        return;
+    }
+    const bool keep = strata::core::gpu_only_ram_cache();
+    const char* mv = std::getenv("STRATA_GPU_ONLY_RING_MIB");   // (no RAM cache: only what one dispatch needs, whatever this says)
+    const uint64_t want = keep ? (uint64_t) (mv != nullptr ? std::max<long long>(0, std::atoll(mv)) : 1024) << 20 : 0;
+    const int protect = spec_split ? 3 : 1;
+    std::string why;
+    std::string zc_why;   // STRATA_GPU_ONLY_ZERO_COPY=1: why the reads do not land in the slots themselves
+    const bool zero_copy = strata::core::gpu_only_zero_copy();
+    if (zero_copy && src->can_read_in_place(zc_why)) g_gpu_ring.want_in_place(src);
+    if (plan == nullptr || !g_gpu_ring.open(n_layers, n_expert, strata::kernels::cpu::expert_layout().max_blob,
+                                            plan->cap * protect, protect, want, why)) {
+        strata::core::set_gpu_only_misses(false);
+        std::fprintf(stderr, "strata serve: GPU-only misses OFF: %s; the CPU computes the missed experts\n",
+                     plan == nullptr ? "no GPU plan" : why.c_str());
+        return;
+    }
+    d.gring = &g_gpu_ring;
+    if (!keep)
+        std::fprintf(stderr, "strata serve: GPU-only misses ON, no RAM cache (STRATA_GPU_ONLY_RAM_CACHE=0): no expert is computed on the CPU and none stays in RAM; "
+                             "a missed expert is read %s into one of %lld transit slots (%.0f MiB of GPU-readable RAM) and the GPU %s it\n",
+                     unbuffered ? "unbuffered" : "through the file cache", (long long) g_gpu_ring.slots(), (double) g_gpu_ring.bytes() / 1048576.0,
+                     pcie_mode == 1 ? "reads it there" : "copies it to VRAM and computes");
+    else
+    std::fprintf(stderr, "strata serve: GPU-only misses ON: no expert is computed on the CPU; a missed expert is read %s into a ring of "
+                         "%.0f MiB of GPU-readable RAM (%lld slots) and the GPU %s it (STRATA_GPU_ONLY=0 turns this off)\n",
+                 unbuffered ? "unbuffered" : "through the file cache", (double) g_gpu_ring.bytes() / 1048576.0,
+                 (long long) g_gpu_ring.slots(), pcie_mode == 1 ? "reads it there" : "copies it to VRAM and computes");
+    if (zero_copy) {
+        if (g_gpu_ring.in_place() && g_gpu_ring.probe_in_place(n_layers, n_expert, zc_why))
+            std::fprintf(stderr, "strata serve: GPU-only misses: zero copy ON (STRATA_GPU_ONLY_ZERO_COPY=1): a missed expert is read straight into its slot, "
+                                 "no aligned buffer and no CPU copy (probe: 3 blobs read that way equal the copied ones)\n");
+        else
+            std::fprintf(stderr, "strata serve: GPU-only misses: zero copy OFF: %s; the reads go through the aligned buffer, as without the switch\n", zc_why.c_str());
+    }
+}
+
 // 0.1.42, CUDA single-GPU serve, no --pcie-frac: the share refined from what the CPU pool measures in the first decode
 // windows.  The balance share of the missed experts is link / (link + CPU rate).  The link is the start-up probe; the CPU
 // rate is the expert bytes over the pool's wall time per missed expert (ExpertDispatch::ms_run / multi_misses), which the
@@ -7474,7 +7524,26 @@ int main(int argc, char** argv) {
         // #773: without a RAM budget there is no RAM copy and the file cache IS the expert tier (measured on a
         // 32 GB, 2 x 16 GB rig: forcing unbuffered reads there re-read 163-629 GB from the drive and halved the
         // speed), so STRATA_UNBUFFERED_LOAD=1 is not honoured in that mode
-        if (o.resident_budget > 0) {
+        // The GPU-only copy: the prompt path has no CPU share either, and with no RAM budget the file tier reads unbuffered
+        // (the ring holds the experts that come back, the file cache has no job left)
+        if (strata::core::gpu_only_misses()) {
+            const char* sv = std::getenv("STRATA_PREFILL_CPU_SHARE");
+            if (sv != nullptr && std::strcmp(sv, "0") != 0)
+                std::fprintf(stderr, "strata generate: GPU-only misses: STRATA_PREFILL_CPU_SHARE=%s is ignored\n", sv);
+#if defined(_WIN32)
+            _putenv_s("STRATA_PREFILL_CPU_SHARE", "0");
+#else
+            setenv("STRATA_PREFILL_CPU_SHARE", "0", 1);
+#endif
+        }
+        if (strata::core::gpu_only_misses() && !strata::core::gpu_only_ram_cache() && (o.resident_budget > 0 || o.resident_cpu_experts))
+            std::fprintf(stderr, "strata generate: GPU-only misses: STRATA_GPU_ONLY_RAM_CACHE=0 leaves the RAM copy that --resident-budget-gib / --resident-experts asks for\n");
+        if (strata::core::gpu_only_misses() && !(o.resident_budget > 0) && strata::core::gpu_only_direct()) {
+            std::string why;
+            const bool ub = src.force_unbuffered(why);
+            std::fprintf(stderr, "strata generate: GPU-only misses: the file tier reads %s%s%s\n",
+                         ub ? "unbuffered" : "through the file cache", why.empty() ? "" : ": ", why.c_str());
+        } else if (o.resident_budget > 0) {
             std::string why;
             const bool ub = src.set_unbuffered(o.resident_budget, why);
             std::fprintf(stderr, "strata generate: the file tier reads %s (%s)\n",
@@ -12632,6 +12701,26 @@ int main(int argc, char** argv) {
             }
         }
         drive.d.plan = ver.plan_sink();
+        {   // the GPU-only copy (a DMA stage cannot take more than staging holds: the copy kernel then, as auto)
+            const char* refuse = srcp != &src ? "the experts are not read from the files (it needs --mmap-experts)"
+                                 : !native_pack ? "not a native pack"
+                                 : n_stages > 1 || multi_gpu || o.peer_device >= 0 || drive.d.remote_count > 0 ? "more than one GPU"
+                                 : o.batch > 0 ? "batch slots"
+                                 : o.pipeline_windows >= 2 ? "--pipeline-windows"
+                                 : std::getenv("STRATA_VERIFY_DEVICE_PLAN") != nullptr ? "STRATA_VERIFY_DEVICE_PLAN"
+                                 : nullptr;
+            int gmode = o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2;
+            if (refuse == nullptr && strata::core::gpu_only_misses() && gmode == 0) {
+                gmode = 2;
+                ver.set_pcie_mode(2);
+                std::fprintf(stderr, "strata serve: GPU-only misses: --pcie-mode dma is not used (the copy kernel, as auto)\n");
+            }
+            gpu_only_arm(drive.d, drive.d.plan, refuse, o.spec_split, g.n_layers, g.n_expert, src.unbuffered(), gmode, &src);
+            if (drive.d.gring != nullptr && !strata::core::gpu_only_ram_cache()) {
+                const uint64_t freed = src.stage_release();
+                std::fprintf(stderr, "strata serve: GPU-only misses: the start's stage buffers are freed (%.0f MiB)\n", (double) freed / 1048576.0);
+            }
+        }
         // Foresight swap space (STRATA_FS_SLOTS; unset = null and nothing changes)
         std::unique_ptr<strata::core::ForesightSwap> fs_swap;
         {
@@ -12776,7 +12865,9 @@ int main(int argc, char** argv) {
                               : o.pipeline_windows > 0 ? "--pipeline-windows" : o.batch > 0 ? "--batch"
                               : adapt_overlap() ? "STRATA_ADAPT_OVERLAP=1" : nullptr;
         if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in)
-            const char* off = drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
+            // the GPU-only copy: its ring takes every miss, past the 64 fetches and the staging the admission is sized for
+            const char* off = drive.d.gring != nullptr ? "GPU-only misses: the ring takes every miss"
+                            : drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
                             : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"
                             : drive.d.plan == nullptr ? "no GPU plan"
                             : drive.d.pcie_num <= 0 ? "no PCIe share"
@@ -13047,6 +13138,7 @@ int main(int argc, char** argv) {
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            const strata::core::ExpertTraceWhy trace_why(strata::core::kExpTraceWhySwap);
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -13099,6 +13191,8 @@ int main(int argc, char** argv) {
             };
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
             adapt_nswaps += (int64_t) swaps.size();   // (read after the thread's join)
+            if (strata::core::expert_trace_on())
+                for (const Swap& s : swaps) strata::core::expert_trace_swap(s.layer, s.in, s.out);
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
                 for (const Swap& s : swaps)
@@ -13138,6 +13232,8 @@ int main(int argc, char** argv) {
                 }
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = fenced_slots.empty() ? host_res[out] : fenced_slots[si];
+                // the GPU-only copy, no RAM cache: from the drive, even if a stage buffer still holds it
+                if (drive.d.gring != nullptr && !strata::core::gpu_only_ram_cache()) src.stage_forget(s.layer, s.in);
                 const uint8_t* b = srcp->blob_stable(s.layer, s.in);
                 nib::guard_raw(s.layer, "the adaptive tier's copy in");
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
@@ -17236,6 +17332,10 @@ int main(int argc, char** argv) {
                 };
                 bool conc_read = false;   // run_conc: the slots decode beside the read, so the share stays off for all of it
                 auto run = [&](int64_t q, int64_t r) -> bool {
+                    if (strata::core::expert_trace_on()) {   // the GPU-only copy's trace: the prompt read starts
+                        strata::core::expert_trace_phase(strata::core::kExpTracePrompt);
+                        strata::core::expert_trace_resident(host_res.data(), (int64_t) host_res.size() / g.n_expert, g.n_expert);
+                    }
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
                     if (!conc_read) share_gate();   // STRATA_PREFILL_CPU_SHARE_BATCH: re-decided for every run (a piece beside decoding slots too)
                     bool run_ok;
@@ -17249,6 +17349,7 @@ int main(int argc, char** argv) {
                         kva_floors.note(ids.data(), sp.kva_floor());
                         if (use_mtp && mtp.cell_floor_enabled()) mtp.set_cell_floor(sp.kva_floor());
                     }
+                    if (strata::core::expert_trace_on()) strata::core::expert_trace_phase(strata::core::kExpTraceDecode);
                     return run_ok;
                 };
                 // STRATA_BATCH_CONCURRENT_READ=1 (opt-in, one GPU, --batch with --no-prefill-borrow): the prompt is read on a
@@ -19736,6 +19837,7 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (strata::core::expert_trace_on()) strata::core::expert_trace_request_end(read_n, resume, produced_n);
             if (serve_adapt_drain_ms >= 1.0)
                 std::fprintf(stderr, "strata serve: the request first waited %.0f ms for the adaptive tier's round in flight\n",
                              serve_adapt_drain_ms);
@@ -19752,6 +19854,22 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
+            }
+            if (drive.d.gring != nullptr) {   // the GPU-only copy: this request (the counters are cumulative)
+                static int64_t a0 = 0, k0 = 0, r0 = 0, n0 = 0, j0 = 0, e0 = 0;
+                static uint64_t b0 = 0;
+                static double m0 = 0;
+                const strata::core::GpuMissRing& gr = *drive.d.gring;
+                const int64_t blobs = gr.blobs_read - r0;
+                const double ms = drive.d.ms_gring_read - m0;
+                std::fprintf(stderr, "strata serve: GPU-only misses: %lld experts went to the GPU (%lld still in the ring, %lld read: "
+                                     "%.1f MB in %.0f ms, %.2f ms a blob); computed on the CPU: %lld experts (%lld entries); no ring slot: %lld\n",
+                             (long long) (gr.asked - a0), (long long) (gr.kept - k0), (long long) blobs,
+                             (double) (gr.bytes_read - b0) / 1e6, ms, blobs > 0 ? ms / (double) blobs : 0.0,
+                             (long long) (drive.d.multi_misses - j0), (long long) (drive.d.multi_entries - e0),
+                             (long long) (gr.refused - n0));
+                a0 = gr.asked; k0 = gr.kept; r0 = gr.blobs_read; n0 = gr.refused; b0 = gr.bytes_read;
+                m0 = drive.d.ms_gring_read; j0 = drive.d.multi_misses; e0 = drive.d.multi_entries;
             }
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
@@ -20440,6 +20558,10 @@ int main(int argc, char** argv) {
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         drive.d.plan = ver.plan_sink();
+        if (strata::core::gpu_only_misses()) {   // the GPU-only copy is wired into --serve only
+            strata::core::set_gpu_only_misses(false);
+            std::fprintf(stderr, "strata generate: GPU-only misses OFF: only --serve has them; the CPU computes the missed experts\n");
+        }
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;

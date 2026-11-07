@@ -257,6 +257,17 @@ public:
     /// blob of (layers[i], experts[i]).  A source that reads a drive may merge neighbouring blobs into one request.
     /// Default: copy_blob one by one.
     virtual bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n);
+    /// The GPU-only copy, STRATA_GPU_ONLY_ZERO_COPY=1: whether `read_in_place` works on this source (`why`: why not).
+    virtual bool can_read_in_place(std::string& why) const { why = "the experts are not read from files"; return false; }
+    /// Where in its 4 KiB window of the file the blob starts: the bytes `read_in_place` leaves before the blob in its slot.
+    virtual uint64_t in_place_skip(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return 0; }
+    /// `n` blobs from the drive, each read straight to `slots[i]` (4 KiB-aligned, with room for the blob's whole 4 KiB
+    /// window), the blob itself at `slots[i] + in_place_skip`: no scratch buffer, no CPU copy.  False: a read failed (`why`).
+    virtual bool read_in_place(const int32_t* layers, const int32_t* experts, uint8_t* const* slots, size_t n, std::string& why) {
+        (void) layers; (void) experts; (void) slots; (void) n;
+        why = "the experts are not read from files";
+        return false;
+    }
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -377,7 +388,7 @@ private:
 /// after the ring and published before the CPU starts its own share.  Groups of entries that share a blob; the
 /// blob is a VRAM slot or a pinned host blob read over PCIe.
 struct GpuPlanSink {
-    int32_t* counts = nullptr;             ///< [0] groups, [1] entries
+    int32_t* counts = nullptr;             ///< [0] groups, [1] entries (GPU-only copy: [3] the PCIe groups that fit in staging)
     int32_t* start = nullptr;              ///< cap + 1
     int32_t* dst = nullptr;                ///< cap: the entry's row of parts (token * k + j)
     int32_t* tok = nullptr;                ///< cap: the entry's token
@@ -497,7 +508,11 @@ struct PcieModel {
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ForesightSwap;
 
+class GpuMissRing;
+
 struct ExpertDispatch {
+    GpuMissRing* gring = nullptr;  ///< the GPU-only copy: set, every missed expert is read into this ring for the GPU
+    double ms_gring_read = 0;      ///< the GPU-only copy: the time those reads took (inside ms_plan)
     ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
@@ -703,6 +718,97 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
 
+// ---- GPU-only misses: this copy of the engine, not upstream.  STRATA_GPU_ONLY=0: off, the CPU computes the missed experts
+// as upstream does.  STRATA_GPU_ONLY_DIRECT=0: the ring is filled through the file cache instead of unbuffered reads.
+// STRATA_GPU_ONLY_RAM_CACHE=0: nothing keeps an expert in RAM.  The ring holds only the blobs of the dispatch under way and
+// no blob is used twice, the file tier reads unbuffered whatever STRATA_GPU_ONLY_DIRECT says, the start's stage buffers are
+// freed and an adaptive swap reads its blob from the drive.  (The bytes still pass through RAM: the GPU cannot read a drive.)
+// STRATA_GPU_ONLY_ZERO_COPY=1: a missed expert's unbuffered read lands in its ring slot itself, no scratch buffer and no CPU
+// copy (Windows, experts.bin).  Unset, nothing changes: not the reads, not the slots, not the log.
+bool gpu_only_misses();
+void set_gpu_only_misses(bool on);
+bool gpu_only_direct();
+bool gpu_only_ram_cache();
+bool gpu_only_zero_copy();
+
+// ---- The expert trace: this copy of the engine, not upstream.  STRATA_EXPERT_TRACE=<file>: which experts each phase routes,
+// reads from the drive and swaps in and out of VRAM, as 16-byte records kept in memory and written when a request ends, so the
+// file does not disturb a window.  Unset, each place below is one test of a constant and nothing else changes.  The prompt
+// path's routing stays on the GPU, so with the trace on each layer of a prompt read waits for its router and downloads the ids:
+// the counts are right, the prompt's time is not the same as without the trace.
+enum ExpertTraceKind : uint8_t {
+    kExpTraceRouted = 1,     ///< a window (decode) or chunk (prompt) routed this expert; aux: entries, 0x8000 if it was in VRAM
+    kExpTraceRead = 2,       ///< a blob read from the drive; aux: why (kExpTraceWhy...)
+    kExpTraceSwapIn = 3,     ///< the adaptive tier takes it into VRAM; aux: the expert it replaces
+    kExpTraceSwapOut = 4,    ///< the adaptive tier evicts it; aux: the expert that replaces it
+    kExpTraceResident = 5,   ///< in VRAM when this request's prompt starts
+    kExpTracePhase = 6,      ///< the phase changes (the record's phase is the new one)
+    kExpTraceBlobBytes = 7,  ///< a layer's blob size; window: the bytes
+    kExpTraceRequest = 8,    ///< a request ended; window: prompt tokens read, aux: tokens generated, layer + (expert << 16): reused
+};
+enum ExpertTracePhase : uint8_t { kExpTraceStart = 0, kExpTracePrompt = 1, kExpTraceDecode = 2, kExpTraceIdle = 3 };
+enum ExpertTraceWhyRead : uint8_t { kExpTraceWhyOther = 0, kExpTraceWhyMiss = 1, kExpTraceWhySwap = 2 };
+bool expert_trace_on();
+void expert_trace_phase(uint8_t phase);
+void expert_trace_routed(int64_t layer, const int32_t* ids, int64_t n, int64_t n_expert, const int32_t* host_res);
+void expert_trace_read(int64_t layer, int64_t expert, uint64_t blob_bytes);
+void expert_trace_swap(int64_t layer, int64_t in, int64_t out);
+void expert_trace_resident(const int32_t* host_res, int64_t n_layers, int64_t n_expert);
+void expert_trace_request_end(int64_t read, int64_t reused, int64_t generated);
+/// What this thread's reads are for, until the scope ends.
+class ExpertTraceWhy {
+public:
+    explicit ExpertTraceWhy(uint8_t why);
+    ~ExpertTraceWhy();
+    ExpertTraceWhy(const ExpertTraceWhy&) = delete;
+    ExpertTraceWhy& operator=(const ExpertTraceWhy&) = delete;
+private:
+    int prev_ = -1;
+};
+/// GPU-readable host memory (allocated as the verify window's CPU rows are, which the GPU reads every layer) that holds
+/// the blobs of the missed experts.  A blob stays until the clock takes its slot, so an expert missed again soon needs no
+/// read.  One thread (the dispatch).  The slots a window's layer reads are safe from the next layer's claims: the GPU has
+/// finished a layer before it rings the next layer's doorbell (`protect` dispatches: a split window overlaps two groups).
+class GpuMissRing {
+public:
+    /// STRATA_GPU_ONLY_ZERO_COPY=1, before `open`: this source reads straight into the slots.  Each slot then starts on a
+    /// 4 KiB boundary with room for a blob's whole 4 KiB window, and `claim` gives the place the blob's first byte lands at.
+    void want_in_place(ExpertSource* src) { place_ = src; in_place_ = src != nullptr; }
+    /// After `open`, before the first dispatch: three blobs read straight into slots must equal what `copy_blob` gives.
+    /// False (`why`): the ring goes on as if it had never been asked; only its slots stay one page longer.
+    bool probe_in_place(int64_t n_layers, int64_t n_expert, std::string& why);
+    bool in_place() const { return in_place_; }
+    bool open(int64_t n_layers, int64_t n_expert, uint64_t max_blob, int64_t min_slots, int protect, uint64_t bytes_wanted,
+              std::string& why);
+    void begin() { ++seq_; rl_.clear(); re_.clear(); rd_.clear(); }
+    /// The expert's slot, its bytes there now or after `read`.  False: every slot is in use (the expert stays on the CPU).
+    bool claim(int64_t layer, int64_t expert, const uint8_t*& host, unsigned long long& device);
+    size_t to_read() const { return rd_.size(); }
+    /// Reads what `claim` left to read, as one batch.  The caller raises the GPU's flag after it.  A failed read in place
+    /// stops that for good and reads through the source's `copy_blobs` to the same places: the plan is already out.
+    bool read(ExpertSource* src);
+    int64_t slots() const { return slots_; }
+    uint64_t bytes() const { return (uint64_t) slots_ * stride_; }
+    int64_t asked = 0, kept = 0, blobs_read = 0, refused = 0;
+    uint64_t bytes_read = 0;
+
+private:
+    uint8_t* host_ = nullptr;
+    uint8_t* device_ = nullptr;
+    uint64_t stride_ = 0, seq_ = 0;
+    int64_t n_expert_ = 0, slots_ = 0, hand_ = 0;
+    int protect_ = 1;
+    bool keep_ = true;            ///< false: STRATA_GPU_ONLY_RAM_CACHE=0, a blob is read for its dispatch and never used again
+    ExpertSource* place_ = nullptr;   ///< STRATA_GPU_ONLY_ZERO_COPY=1: `claim` adds the blob's place in its 4 KiB window ...
+    bool in_place_ = false;           ///< ... and `read` reads straight into the slots
+    std::vector<int32_t> of_;     ///< layer * n_expert + expert -> slot, or -1 (keep_ only)
+    std::vector<int32_t> key_;    ///< slot -> layer * n_expert + expert, or -1 (keep_ only)
+    std::vector<uint64_t> used_;  ///< slot -> the dispatch that last asked for it
+    std::vector<uint8_t> ref_;    ///< slot -> asked for since the clock last passed
+    std::vector<int32_t> rl_, re_;
+    std::vector<uint8_t*> rd_;
+};
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default);
 
@@ -901,6 +1007,17 @@ public:
     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
     bool recheck_unbuffered(std::string& why);
     bool unbuffered() const { return !direct_.empty(); }
+    /// The GPU-only copy: unbuffered reads whatever the RAM could keep (the ring is the expert tier outside VRAM, not the file cache).
+    bool force_unbuffered(std::string& why);
+    /// The GPU-only copy, STRATA_GPU_ONLY_RAM_CACHE=0: the next reader of this blob gets it from the drive, even if a stage
+    /// buffer still holds it.
+    void stage_forget(int64_t layer, int64_t expert);
+    /// ... and the stage buffers the start left behind are freed.  Returns their bytes; a later reader gets new buffers.
+    uint64_t stage_release();
+    /// The GPU-only copy, STRATA_GPU_ONLY_ZERO_COPY=1: Windows, experts.bin, unbuffered, no RAM tier (see ExpertSource).
+    bool can_read_in_place(std::string& why) const override;
+    uint64_t in_place_skip(int64_t layer, int64_t expert) const override;
+    bool read_in_place(const int32_t* layers, const int32_t* experts, uint8_t* const* slots, size_t n, std::string& why) override;
     /// MODEL-UPDATE round 2 (Linux, opt-in STRATA_PROMPT_DIRECT=1): with the file tier read through the file cache (the
     /// decode's choice: re-routed experts come back from it), the prompt path's batched stager reads (copy_blobs) go
     /// unbuffered instead - the same bytes, read in merged O_DIRECT requests.  False when not opened (and why).

@@ -33,6 +33,12 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -959,7 +965,14 @@ void mtp_list_nodes(cudaGraph_t graph, const char* what) {
         if (ty == hipGraphNodeTypeKernel) {
             hipKernelNodeParams kp{};
             if (hipGraphKernelNodeGetParams(nd, &kp) == hipSuccess && kp.func != nullptr) {
+#if defined(_WIN32)
+                using Fn_hipKernelNameRefByPtr = const char* (*)(const void*, hipStream_t);
+                static auto p_hipKernelNameRefByPtr = reinterpret_cast<Fn_hipKernelNameRefByPtr>(
+                    GetProcAddress(GetModuleHandleA("amdhip64_7.dll"), "hipKernelNameRefByPtr"));
+                const char* fn = p_hipKernelNameRefByPtr ? p_hipKernelNameRefByPtr(kp.func, nullptr) : nullptr;
+#else
                 const char* fn = hipKernelNameRefByPtr(kp.func, nullptr);
+#endif
                 if (fn != nullptr) name = fn;
             }
         }

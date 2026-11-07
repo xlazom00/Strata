@@ -13,6 +13,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 
 #include "strata/core/pinned.hpp"
+#include "strata/core/pin_budget.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -2751,6 +2752,10 @@ bool FileExpertSource::map_view(std::string& why) {
 }
 
 bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+    if (expert_trace_on())
+        for (size_t i = 0; i < n; ++i)
+            if (fills[i].layer >= 0 && fills[i].layer < n_layers_)
+                expert_trace_read(fills[i].layer, fills[i].e, layer_blob_bytes_[(size_t) fills[i].layer]);
 #if defined(_WIN32)
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
@@ -4885,6 +4890,452 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+// ================================ GPU-ONLY MISSES (this copy of the engine, not upstream) ================================
+namespace {
+std::atomic<int> g_gpu_only{-1};   // -1: not resolved yet
+}  // namespace
+bool gpu_only_misses() {
+    int v = g_gpu_only.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("STRATA_GPU_ONLY");
+        v = e != nullptr && e[0] == '0' ? 0 : 1;
+        g_gpu_only.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+void set_gpu_only_misses(bool on) { g_gpu_only.store(on ? 1 : 0, std::memory_order_relaxed); }
+bool gpu_only_ram_cache() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_GPU_ONLY_RAM_CACHE"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
+bool gpu_only_direct() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_GPU_ONLY_DIRECT"); return e == nullptr || e[0] != '0'; }();
+    return on || !gpu_only_ram_cache();   // the file cache is a RAM cache too
+}
+bool gpu_only_zero_copy() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_GPU_ONLY_ZERO_COPY"); return e != nullptr && e[0] != '\0' && e[0] != '0'; }();
+    return on;
+}
+
+// ---- The expert trace (see the header)
+namespace {
+struct ExpTraceRec {
+    uint32_t t;        // 10 us units since the trace opened
+    uint32_t window;   // the windows (decode) and chunks (prompt) so far; kExpTraceBlobBytes, kExpTraceRequest: their number
+    uint16_t layer, expert, aux;
+    uint8_t kind, phase;
+};
+static_assert(sizeof(ExpTraceRec) == 16, "the report reads 16-byte records");
+struct ExpTrace {
+    std::mutex mu;
+    std::FILE* f = nullptr;
+    std::vector<ExpTraceRec> recs;
+    std::vector<uint32_t> count;
+    std::vector<uint8_t> blob_said;
+    std::chrono::steady_clock::time_point t0;
+    uint32_t window = 0;
+    int64_t last_layer = -1;
+    uint8_t phase = kExpTraceStart;
+    bool snapshot_done = false;
+    uint32_t now() const {
+        return (uint32_t) (std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count() / 10);
+    }
+    void add(uint8_t kind, int64_t layer, int64_t expert, uint32_t aux, uint32_t t, uint32_t win) {
+        recs.push_back({t, win, (uint16_t) layer, (uint16_t) expert, (uint16_t) aux, kind, phase});
+    }
+    void to_phase(uint8_t p, uint32_t t) {
+        phase = p;
+        last_layer = -1;
+        ++window;
+        add(kExpTracePhase, 0, 0, 0, t, window);
+    }
+};
+ExpTrace& exp_trace() {
+    static ExpTrace* t = new ExpTrace;   // never destroyed: a thread may still note a read while the process exits
+    return *t;
+}
+thread_local uint8_t tl_exp_trace_why = kExpTraceWhyOther;
+}  // namespace
+
+bool expert_trace_on() {
+    static const bool on = [] {
+        const char* path = std::getenv("STRATA_EXPERT_TRACE");
+        if (path == nullptr || path[0] == '\0') return false;
+        ExpTrace& t = exp_trace();
+        t.f = std::fopen(path, "wb");
+        if (t.f == nullptr) {
+            std::fprintf(stderr, "strata: expert trace: cannot write %s; no trace\n", path);
+            return false;
+        }
+        t.recs.reserve((size_t) 1 << 21);
+        t.t0 = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "strata: expert trace ON (STRATA_EXPERT_TRACE): every routed, read and swapped expert goes to %s; "
+                             "each prompt layer waits for its router, so a prompt's time is not comparable\n", path);
+        return true;
+    }();
+    return on;
+}
+
+void expert_trace_phase(uint8_t phase) {
+    ExpTrace& t = exp_trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    if (phase != t.phase) t.to_phase(phase, t.now());
+}
+
+void expert_trace_routed(int64_t layer, const int32_t* ids, int64_t n, int64_t n_expert, const int32_t* host_res) {
+    ExpTrace& t = exp_trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    if (layer <= t.last_layer) ++t.window;
+    t.last_layer = layer;
+    if ((int64_t) t.count.size() < n_expert) t.count.assign((size_t) n_expert, 0);
+    for (int64_t i = 0; i < n; ++i)
+        if (ids[i] >= 0 && ids[i] < n_expert) ++t.count[(size_t) ids[i]];
+    const uint32_t when = t.now();
+    for (int64_t i = 0; i < n; ++i) {
+        if (ids[i] < 0 || ids[i] >= n_expert) continue;
+        uint32_t& c = t.count[(size_t) ids[i]];
+        if (c == 0) continue;
+        const bool in_vram = host_res != nullptr && host_res[(size_t) layer * (size_t) n_expert + (size_t) ids[i]] >= 0;
+        t.add(kExpTraceRouted, layer, ids[i], std::min<uint32_t>(c, 0x7fff) | (in_vram ? 0x8000u : 0u), when, t.window);
+        c = 0;
+    }
+}
+
+void expert_trace_read(int64_t layer, int64_t expert, uint64_t blob_bytes) {
+    ExpTrace& t = exp_trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    const uint32_t when = t.now();
+    if ((int64_t) t.blob_said.size() <= layer) t.blob_said.resize((size_t) layer + 1, 0);
+    if (t.blob_said[(size_t) layer] == 0) {
+        t.blob_said[(size_t) layer] = 1;
+        t.add(kExpTraceBlobBytes, layer, 0, 0, when, (uint32_t) blob_bytes);
+    }
+    t.add(kExpTraceRead, layer, expert, tl_exp_trace_why, when, t.window);
+}
+
+void expert_trace_swap(int64_t layer, int64_t in, int64_t out) {
+    ExpTrace& t = exp_trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    const uint32_t when = t.now();
+    t.add(kExpTraceSwapIn, layer, in, (uint32_t) out, when, t.window);
+    t.add(kExpTraceSwapOut, layer, out, (uint32_t) in, when, t.window);
+}
+
+void expert_trace_resident(const int32_t* host_res, int64_t n_layers, int64_t n_expert) {
+    ExpTrace& t = exp_trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    if (t.snapshot_done) return;
+    t.snapshot_done = true;
+    const uint32_t when = t.now();
+    for (int64_t l = 0; l < n_layers; ++l)
+        for (int64_t e = 0; e < n_expert; ++e)
+            if (host_res[(size_t) l * (size_t) n_expert + (size_t) e] >= 0) t.add(kExpTraceResident, l, e, 0, when, t.window);
+}
+
+void expert_trace_request_end(int64_t read, int64_t reused, int64_t generated) {
+    ExpTrace& t = exp_trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    const uint32_t when = t.now();
+    t.add(kExpTraceRequest, reused & 0xffff, (reused >> 16) & 0xffff, (uint32_t) std::min<int64_t>(generated, 0xffff), when, (uint32_t) read);
+    t.to_phase(kExpTraceIdle, when);
+    t.snapshot_done = false;
+    if (!t.recs.empty()) std::fwrite(t.recs.data(), sizeof(ExpTraceRec), t.recs.size(), t.f);
+    std::fflush(t.f);
+    t.recs.clear();
+}
+
+ExpertTraceWhy::ExpertTraceWhy(uint8_t why) {
+    if (expert_trace_on()) {
+        prev_ = tl_exp_trace_why;
+        tl_exp_trace_why = why;
+    }
+}
+ExpertTraceWhy::~ExpertTraceWhy() {
+    if (prev_ >= 0) tl_exp_trace_why = (uint8_t) prev_;
+}
+
+bool GpuMissRing::open(int64_t n_layers, int64_t n_expert, uint64_t max_blob, int64_t min_slots, int protect,
+                       uint64_t bytes_wanted, std::string& why) {
+    if (n_layers <= 0 || n_expert <= 0 || max_blob == 0 || min_slots <= 0) {
+        why = "the window has no GPU plan";
+        return false;
+    }
+    stride_ = (max_blob + 4095) & ~(uint64_t) 4095;
+    if (place_ != nullptr) stride_ += 4096;   // a blob's 4 KiB window can be one page longer than the blob rounded up
+    keep_ = gpu_only_ram_cache();
+    slots_ = keep_ ? std::max<int64_t>(min_slots, (int64_t) (bytes_wanted / stride_)) : min_slots;
+    const uint64_t bytes = (uint64_t) slots_ * stride_;
+    const uint64_t slack = place_ != nullptr ? 4096 : 0;   // room to start the first slot on a 4 KiB boundary
+    void* h = nullptr;
+    void* dv = nullptr;
+    if (host_alloc_guarded(&h, (size_t) (bytes + slack), cudaHostAllocMapped) != cudaSuccess || h == nullptr) {
+        (void) cudaGetLastError();
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "%.0f MiB of GPU-readable RAM could not be allocated", (double) bytes / 1048576.0);
+        why = msg;
+        return false;
+    }
+    std::memset(h, 0, (size_t) (bytes + slack));
+    if (cudaHostGetDevicePointer(&dv, h, 0) != cudaSuccess || dv == nullptr) {
+        (void) cudaGetLastError();
+        (void) cudaFreeHost(h);
+        why = "the GPU has no address for the ring";
+        return false;
+    }
+    const size_t shift = place_ != nullptr ? (size_t) ((4096 - ((uintptr_t) h & 4095)) & 4095) : 0;
+    host_ = (uint8_t*) h + shift;
+    device_ = (uint8_t*) dv + shift;
+    n_expert_ = n_expert;
+    protect_ = std::max(1, protect);
+    if (keep_) {
+        of_.assign((size_t) (n_layers * n_expert), -1);
+        key_.assign((size_t) slots_, -1);
+    }
+    used_.assign((size_t) slots_, 0);
+    ref_.assign((size_t) slots_, 0);
+    return true;
+}
+
+bool GpuMissRing::claim(int64_t layer, int64_t expert, const uint8_t*& host, unsigned long long& device) {
+    ++asked;
+    const int32_t index = (int32_t) (layer * n_expert_ + expert);
+    int32_t s = keep_ ? of_[(size_t) index] : -1;
+    if (s >= 0) {
+        ref_[(size_t) s] = 1;
+        used_[(size_t) s] = seq_;
+        ++kept;
+    } else {
+        // the clock: a slot asked for since the last pass gets one more pass; the slots the GPU may still read are left alone
+        for (int64_t tries = 0; tries < 2 * slots_ + 2; ++tries) {
+            const int64_t v = hand_;
+            hand_ = hand_ + 1 == slots_ ? 0 : hand_ + 1;
+            if (used_[(size_t) v] != 0 && used_[(size_t) v] + (uint64_t) protect_ > seq_) continue;
+            if (ref_[(size_t) v]) { ref_[(size_t) v] = 0; continue; }
+            s = (int32_t) v;
+            break;
+        }
+        if (s < 0) { ++refused; return false; }
+        if (keep_) {
+            if (key_[(size_t) s] >= 0) of_[(size_t) key_[(size_t) s]] = -1;
+            key_[(size_t) s] = index;
+            of_[(size_t) index] = s;
+        }
+        used_[(size_t) s] = seq_;
+        rl_.push_back((int32_t) layer);
+        re_.push_back((int32_t) expert);
+        rd_.push_back(host_ + (size_t) s * (size_t) stride_);
+    }
+    const size_t skip = place_ != nullptr ? (size_t) place_->in_place_skip(layer, expert) : 0;   // depends on the blob alone: a kept one too
+    host = host_ + (size_t) s * (size_t) stride_ + skip;
+    device = (unsigned long long) (device_ + (size_t) s * (size_t) stride_ + skip);
+    return true;
+}
+
+bool GpuMissRing::read(ExpertSource* src) {
+    const size_t n = rd_.size();
+    if (n == 0) return true;
+    const ExpertTraceWhy trace_why(kExpTraceWhyMiss);
+    bool ok = false;
+    if (in_place_) {
+        std::string why;
+        ok = place_->read_in_place(rl_.data(), re_.data(), rd_.data(), n, why);
+        if (!ok) {
+            in_place_ = false;
+            std::fprintf(stderr, "strata serve: GPU-only misses: zero copy stopped: %s; from here on the reads go through the aligned buffer\n", why.c_str());
+        }
+    }
+    if (!ok) {
+        // the published plan and any kept blob expect the blob where `claim` said, in place or not
+        if (place_ != nullptr)
+            for (size_t i = 0; i < n; ++i) rd_[i] += (size_t) place_->in_place_skip(rl_[i], re_[i]);
+        ok = src->copy_blobs(rl_.data(), re_.data(), rd_.data(), n);
+    }
+    if (!ok) {
+        for (size_t i = 0; keep_ && i < n; ++i) {   // their bytes never came: not in the ring
+            const int32_t index = (int32_t) ((int64_t) rl_[i] * n_expert_ + (int64_t) re_[i]);
+            const int32_t s = of_[(size_t) index];
+            if (s >= 0) key_[(size_t) s] = -1;
+            of_[(size_t) index] = -1;
+        }
+        return false;
+    }
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (size_t i = 0; i < n; ++i) bytes_read += lay.blob_bytes(rl_[i]);
+    blobs_read += (int64_t) n;
+    return true;
+}
+
+bool GpuMissRing::probe_in_place(int64_t n_layers, int64_t n_expert, std::string& why) {
+    bool ok = false;
+    if (place_ == nullptr || !in_place_) {
+        why = "not asked";
+    } else if (slots_ < 3 || n_layers <= 0 || n_expert <= 0) {
+        why = "too few slots";
+    } else {
+        // as a dispatch reads them, one batch: the file's first blob (nothing before it in its page), its second (something
+        // before it, unless blobs are whole pages) and its last
+        const int32_t layers[3] = {0, 0, (int32_t) (n_layers - 1)};
+        const int32_t experts[3] = {0, (int32_t) std::min<int64_t>(1, n_expert - 1), (int32_t) (n_expert - 1)};
+        uint8_t* slot[3] = {host_, host_ + (size_t) stride_, host_ + 2 * (size_t) stride_};
+        if (place_->read_in_place(layers, experts, slot, 3, why)) {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            std::vector<uint8_t> ref;
+            ok = true;
+            for (int i = 0; ok && i < 3; ++i) {
+                ref.resize((size_t) lay.blob_bytes(layers[i]));
+                if (!place_->copy_blob(layers[i], experts[i], ref.data())) {
+                    why = "the blob could not be read for the comparison";
+                    ok = false;
+                } else if (std::memcmp(slot[i] + (size_t) place_->in_place_skip(layers[i], experts[i]), ref.data(), ref.size()) != 0) {
+                    why = "a probe blob came out different";
+                    ok = false;
+                }
+            }
+        }
+    }
+    if (!ok) {   // the slots stay as they are, nobody holds one yet
+        place_ = nullptr;
+        in_place_ = false;
+    }
+    return ok;
+}
+
+bool FileExpertSource::can_read_in_place(std::string& why) const {
+#if defined(_WIN32)
+    if (!role_ptr_.empty()) { why = "the GGUF in place: a blob is three separate ranges (it needs experts.bin)"; return false; }
+    if (direct_.size() != 1) { why = "the reads are not unbuffered"; return false; }
+    if (complement_ready_ || !override_.empty()) { why = "a RAM tier holds experts"; return false; }
+    for (size_t l = 0; l < layer_offsets_.size(); ++l)
+        if (layer_offsets_[l] % 16 != 0 || layer_blob_bytes_[l] % 16 != 0) { why = "a blob does not start on a 16-byte boundary"; return false; }
+    return true;
+#else
+    why = "Windows only";
+    return false;
+#endif
+}
+
+uint64_t FileExpertSource::in_place_skip(int64_t layer, int64_t expert) const {
+    if (!role_ptr_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return 0;
+    return (layer_offsets_[(size_t) layer] + (uint64_t) expert * layer_blob_bytes_[(size_t) layer]) % 4096;
+}
+
+bool FileExpertSource::read_in_place(const int32_t* layers, const int32_t* experts, uint8_t* const* slots, size_t n, std::string& why) {
+#if defined(_WIN32)
+    if (direct_.size() != 1 || !role_ptr_.empty()) { why = "not experts.bin read unbuffered"; return false; }
+    if (expert_trace_on())
+        for (size_t i = 0; i < n; ++i) expert_trace_read(layers[i], experts[i], layer_blob_bytes_[(size_t) layers[i]]);
+    constexpr uint64_t kSector = 4096;
+    // this thread's events, kept for its next batch
+    struct Scratch {
+        std::vector<HANDLE> ev;
+        std::vector<OVERLAPPED> ov;
+        std::vector<DWORD> got;
+        ~Scratch() { for (HANDLE e : ev) CloseHandle(e); }
+    };
+    thread_local Scratch sc;
+    while (sc.ev.size() < n) {
+        HANDLE e = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (e == nullptr) { why = "no event for the read"; return false; }
+        sc.ev.push_back(e);
+    }
+    sc.ov.assign(n, OVERLAPPED{});
+    sc.got.assign(n, 0);
+    const HANDLE h = (HANDLE) direct_[0];
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t bytes = 0;
+    DWORD error = 0;
+    size_t issued = 0;
+    bool ok = true;
+    // every request in flight before the first wait: the drive sees the whole batch as one queue
+    for (size_t i = 0; i < n; ++i) {
+        const int64_t l = layers[i], e = experts[i];
+        if (slots[i] == nullptr || ((uintptr_t) slots[i] & (kSector - 1)) != 0 || l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) {
+            why = "a slot or a blob the read cannot take";
+            ok = false;
+            break;
+        }
+        const uint64_t per = layer_blob_bytes_[(size_t) l];
+        const uint64_t off = layer_offsets_[(size_t) l] + (uint64_t) e * per;
+        const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
+        OVERLAPPED& o = sc.ov[i];
+        o.Offset = (DWORD) a0;
+        o.OffsetHigh = (DWORD) (a0 >> 32);
+        o.hEvent = sc.ev[i];
+        if (!ReadFile(h, slots[i], (DWORD) (a1 - a0), nullptr, &o)) {
+            const DWORD last = GetLastError();
+            if (last != ERROR_IO_PENDING) {
+                error = last;
+                ok = false;
+                break;
+            }
+        }
+        ++issued;
+        bytes += per;
+    }
+    for (size_t q = 0; q < issued; ++q)
+        if (!GetOverlappedResult(h, &sc.ov[q], &sc.got[q], TRUE)) {
+            if (ok) error = GetLastError();
+            ok = false;
+        }
+    if (ok)
+        for (size_t i = 0; i < n; ++i)   // a request may run past the end of the file: only the blob's own bytes have to arrive
+            if ((uint64_t) sc.got[i] < in_place_skip(layers[i], experts[i]) + layer_blob_bytes_[(size_t) layers[i]]) {
+                why = "a short read";
+                ok = false;
+                break;
+            }
+    if (!ok) {
+        if (error != 0) why = "ReadFile into the slot failed with error " + std::to_string((unsigned long long) error);
+        return false;
+    }
+    file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                       std::memory_order_relaxed);
+    file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+#else
+    (void) layers; (void) experts; (void) slots; (void) n;
+    why = "Windows only";
+    return false;
+#endif
+}
+
+bool FileExpertSource::force_unbuffered(std::string& why) {
+#if defined(_WIN32) || defined(__linux__)
+    if (!direct_.empty()) return true;
+    if (base_ == nullptr || paths_.empty()) {
+        why = "no expert files open";
+        return false;
+    }
+    return open_direct(why);
+#else
+    why = "no unbuffered reads on this platform";
+    return false;
+#endif
+}
+
+void FileExpertSource::stage_forget(int64_t layer, int64_t expert) {
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    const auto it = stage_of_.find(layer * n_expert_ + expert);
+    if (it == stage_of_.end() || stage_busy_[it->second]) return;
+    stage_key_[it->second] = -1;   // the buffer ages as before: a copy may still be reading it
+    stage_of_.erase(it);
+}
+
+uint64_t FileExpertSource::stage_release() {
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    (void) cudaDeviceSynchronize();   // the buffers' last copies end before they are freed (#1237)
+    const uint64_t bytes = (uint64_t) stage_buf_.size() * stage_blob_;
+    stage_free_events();
+    stage_buf_.clear();
+    stage_key_.clear();
+    stage_epoch_.clear();
+    stage_used_.clear();
+    stage_busy_.clear();
+    stage_pf_.clear();
+    stage_of_.clear();
+    return bytes;   // stage_blob_ stays: a later reader assembles its blob into a new buffer of that size
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
@@ -4934,6 +5385,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+    if (expert_trace_on()) expert_trace_routed(d.layers, ids, n_tok * k, d.n_expert, d.host_res);
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
@@ -5009,11 +5461,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (pcie_min1 && pcie_ok && m < 1 && nmiss >= 2) m = 1;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
-        const uint8_t* dma_src[64];
-        int64_t pcie_i0[64];
+        const uint8_t* dma_src[kMaxWindowEntries];
+        int64_t pcie_i0[kMaxWindowEntries];
+        unsigned long long ring_dev[kMaxWindowEntries];   // the GPU-only copy: each PCIe group's blob, for the GPU
+        GpuMissRing* const ring = d.gring;
+        if (ring != nullptr) ring->begin();
         // STRATA_ADAPT_FETCH: the share is the layer's most-routed misses, and the ones the tier would swap in are copied
-        // into a slot as they are fetched (ExpertDispatch::fetch_admit)
-        const bool fetch_on = m > 0 && d.fetch_can(d.layers);
+        // into a slot as they are fetched (ExpertDispatch::fetch_admit).  Never beside the GPU-only copy's ring: every
+        // miss flies there, past the 64 fetches and the staging the admission is sized for (generate.cpp keeps it off).
+        const bool fetch_on = ring == nullptr && m > 0 && d.fetch_can(d.layers);
         const float* use = d.usage.empty() ? nullptr : d.usage.data() + (size_t) d.layers * (size_t) d.n_expert;
         bool pick[kMaxWindowEntries];
         if (fetch_on) {
@@ -5053,6 +5509,26 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
+                    if (ring != nullptr) {
+                        // the GPU-only copy: every missed expert flies, whatever the share says.  A pinned RAM copy has its
+                        // device address already; anything else takes a ring slot, read below once the plan is published
+                        const uint8_t* rh = nullptr;
+                        unsigned long long rd = 0;
+                        const uint8_t* alias = d.src->pinned(d.layers, e) ? d.src->device_alias(d.layers, e) : nullptr;
+                        if (alias != nullptr) {
+                            rh = d.src->blob(d.layers, e);
+                            rd = (unsigned long long) alias;
+                        } else if (!ring->claim(d.layers, e, rh, rd)) {
+                            rh = nullptr;
+                        }
+                        if (rh != nullptr) {
+                            kd = 1;
+                            dma_src[fetches] = rh;
+                            ring_dev[fetches] = rd;
+                            pcie_i0[fetches] = i0;
+                            ++fetches;
+                        }
+                    } else
                     if ((fetch_on ? pick[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
@@ -5082,7 +5558,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const uint64_t bb = lay.blob_bytes(d.layers);
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
-            P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
+            P.ptr2[q] = ring != nullptr ? ring_dev[q]
+                                 : P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
             P.start2[q] = entries;
             for (int64_t i = i0; i < n; ++i)
@@ -5093,7 +5570,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             ++d.pcie_experts;
         }
-        if (d.fetch_admit > 0 && P.dst2 != nullptr)
+        if (ring == nullptr && d.fetch_admit > 0 && P.dst2 != nullptr)   // not with the GPU-only ring: more fetches than dst2
             for (int q = 0; q < fetches; ++q) P.dst2[q] = 0;   // staging
         if (fetch_on && fetches > 0 && (size_t) d.layers < d.fetch_avail.size()) d.fetch_avail[(size_t) d.layers] = 1;
         if (fetch_on && fetches > 0) {
@@ -5140,9 +5617,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
+        // the GPU-only copy: the groups the copy kernel stages; a window's further groups (more than staging holds, rare) are
+        // read by the expert kernels from the ring itself
+        P.counts[3] = (int32_t) std::min<int64_t>((int64_t) fetches, P.staging_cap);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
+        if (ring != nullptr && ring->to_read() > 0) {
+            // the plan is out: the GPU computes the resident experts while the drive reads these, and waits at flag B for them
+            const auto r0 = std::chrono::steady_clock::now();
+            const bool read_ok = ring->read(d.src);
+            d.ms_gring_read += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count();
+            if (!read_ok) {
+                d.failed = true;
+                d.fail = "a missed expert could not be read for the GPU";
+                d.fail_layer = d.layers;
+                if (P.fetch) P.fetch(P.ctx, dma_src, 0, (size_t) bb);
+                return;
+            }
+        }
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {

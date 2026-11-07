@@ -3514,6 +3514,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            sink_.counts[3] = 0;   // the GPU-only copy stages counts[3] groups: none, not the last layer's
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -4783,6 +4784,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            sink_.counts[3] = 0;   // the GPU-only copy stages counts[3] groups: none, not the last layer's
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -4998,6 +5000,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            sink_.counts[3] = 0;   // the GPU-only copy stages counts[3] groups: none, not the last layer's
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -5352,6 +5355,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            sink_.counts[3] = 0;   // the GPU-only copy stages counts[3] groups: none, not the last layer's
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);

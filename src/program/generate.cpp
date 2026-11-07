@@ -2720,14 +2720,30 @@ static double pcie_pool_k(double r) {
     return strata::pcie_pool_k(r, on);
 }
 
+// The GPU-only copy of the engine: why this run cannot take it (nullptr: it can), from the options and the pack.  Asked at
+// the start, before the prompt's CPU share and the file tier are set up for the copy, so a run it turns away starts as
+// upstream does; the serve setup asks again with the GPUs it really has (gpu_only_arm's `refuse`).
+static const char* gpu_only_refusal(const Options& o, bool native_pack, int n_stages, bool multi_gpu, int remotes) {
+    return !o.serve ? "only --serve has them"
+           : !native_pack ? "not a native pack"
+           : n_stages > 1 || multi_gpu || o.peer_device >= 0 || remotes > 0 ? "more than one GPU"
+           : o.batch > 0 ? "batch slots"
+           : o.pipeline_windows >= 2 ? "--pipeline-windows"
+           : std::getenv("STRATA_VERIFY_DEVICE_PLAN") != nullptr ? "STRATA_VERIFY_DEVICE_PLAN"
+           : nullptr;
+}
+static bool g_gpu_only_turned_away = false;   // the start's gpu_only_refusal said no (and printed why)
+
 // The GPU-only copy of the engine: the ring of the missed experts, once the verifier says how many entries a window holds.
-// `refuse`: why this run cannot take it.  The ring lives as long as the process.
+// `refuse`: why this run cannot take it.  `split_windows`: a window may run as two groups (--spec-split, or a window past
+// kVerifyMaxT rows), whose dispatches overlap on the GPU.  The ring lives as long as the process.
 static strata::core::GpuMissRing g_gpu_ring;
 static void gpu_only_arm(strata::core::ExpertDispatch& d, const strata::core::GpuPlanSink* plan, const char* refuse,
-                         bool spec_split, int64_t n_layers, int64_t n_expert, bool unbuffered, int pcie_mode,
+                         bool split_windows, int64_t n_layers, int64_t n_expert, bool unbuffered, int pcie_mode,
                          strata::core::ExpertSource* src) {
     if (!strata::core::gpu_only_misses()) {
-        std::fprintf(stderr, "strata serve: GPU-only misses off (STRATA_GPU_ONLY=0): the CPU computes the missed experts, as upstream\n");
+        if (!g_gpu_only_turned_away)   // (a run the start turned away said so then)
+            std::fprintf(stderr, "strata serve: GPU-only misses off (STRATA_GPU_ONLY=0): the CPU computes the missed experts, as upstream\n");
         return;
     }
     if (refuse != nullptr) {
@@ -2738,7 +2754,7 @@ static void gpu_only_arm(strata::core::ExpertDispatch& d, const strata::core::Gp
     const bool keep = strata::core::gpu_only_ram_cache();
     const char* mv = std::getenv("STRATA_GPU_ONLY_RING_MIB");   // (no RAM cache: only what one dispatch needs, whatever this says)
     const uint64_t want = keep ? (uint64_t) (mv != nullptr ? std::max<long long>(0, std::atoll(mv)) : 1024) << 20 : 0;
-    const int protect = spec_split ? 3 : 1;
+    const int protect = split_windows ? 3 : 1;
     std::string why;
     std::string zc_why;   // STRATA_GPU_ONLY_ZERO_COPY=1: why the reads do not land in the slots themselves
     const bool zero_copy = strata::core::gpu_only_zero_copy();
@@ -2746,7 +2762,10 @@ static void gpu_only_arm(strata::core::ExpertDispatch& d, const strata::core::Gp
     if (plan == nullptr || !g_gpu_ring.open(n_layers, n_expert, strata::kernels::cpu::expert_layout().max_blob,
                                             plan->cap * protect, protect, want, why)) {
         strata::core::set_gpu_only_misses(false);
-        std::fprintf(stderr, "strata serve: GPU-only misses OFF: %s; the CPU computes the missed experts\n",
+        // (the start passed gpu_only_refusal and set the prompt's CPU share and the file tier's reads up for the copy;
+        // the prompt path has read its share by now, so they stay)
+        std::fprintf(stderr, "strata serve: GPU-only misses OFF: %s; the CPU computes the missed experts (the prompt's CPU share "
+                             "and the file tier's reads stay as the start set them up for the copy)\n",
                      plan == nullptr ? "no GPU plan" : why.c_str());
         return;
     }
@@ -7603,7 +7622,18 @@ int main(int argc, char** argv) {
         // 32 GB, 2 x 16 GB rig: forcing unbuffered reads there re-read 163-629 GB from the drive and halved the
         // speed), so STRATA_UNBUFFERED_LOAD=1 is not honoured in that mode
         // The GPU-only copy: the prompt path has no CPU share either, and with no RAM budget the file tier reads unbuffered
-        // (the ring holds the experts that come back, the file cache has no job left)
+        // (the ring holds the experts that come back, the file cache has no job left).  A run the copy cannot serve is
+        // turned away first, so neither is set up for it and it starts as upstream does
+        if (strata::core::gpu_only_misses()) {
+            int remotes = 0;   // the helper GPUs, as drive.d.remote_count counts them later
+            for (int r = 0; r < 3; ++r) remotes += o.expert_cache_remote[(size_t) r] > 0 ? 1 : 0;
+            const int stages0 = split_devs.empty() ? 1 : (int) split_at.size() + 1;   // as the serve setup's n_stages
+            if (const char* refuse = gpu_only_refusal(o, native_pack, stages0, multi_gpu, remotes)) {
+                strata::core::set_gpu_only_misses(false);
+                g_gpu_only_turned_away = true;
+                std::fprintf(stderr, "strata generate: GPU-only misses OFF: %s; the CPU computes the missed experts, as upstream\n", refuse);
+            }
+        }
         if (strata::core::gpu_only_misses()) {
             const char* sv = std::getenv("STRATA_PREFILL_CPU_SHARE");
             if (sv != nullptr && std::strcmp(sv, "0") != 0)
@@ -12797,19 +12827,16 @@ int main(int argc, char** argv) {
         drive.d.plan = ver.plan_sink();
         {   // the GPU-only copy (a DMA stage cannot take more than staging holds: the copy kernel then, as auto)
             const char* refuse = srcp != &src ? "the experts are not read from the files (it needs --mmap-experts)"
-                                 : !native_pack ? "not a native pack"
-                                 : n_stages > 1 || multi_gpu || o.peer_device >= 0 || drive.d.remote_count > 0 ? "more than one GPU"
-                                 : o.batch > 0 ? "batch slots"
-                                 : o.pipeline_windows >= 2 ? "--pipeline-windows"
-                                 : std::getenv("STRATA_VERIFY_DEVICE_PLAN") != nullptr ? "STRATA_VERIFY_DEVICE_PLAN"
-                                 : nullptr;
+                                 : gpu_only_refusal(o, native_pack, n_stages, multi_gpu, drive.d.remote_count);
             int gmode = o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2;
             if (refuse == nullptr && strata::core::gpu_only_misses() && gmode == 0) {
                 gmode = 2;
                 ver.set_pcie_mode(2);
                 std::fprintf(stderr, "strata serve: GPU-only misses: --pcie-mode dma is not used (the copy kernel, as auto)\n");
             }
-            gpu_only_arm(drive.d, drive.d.plan, refuse, o.spec_split, g.n_layers, g.n_expert, src.unbuffered(), gmode, &src);
+            // two groups per window: --spec-split, or a window past kVerifyMaxT rows (--lookup-max-t), split without it
+            const bool split_windows = o.spec_split || ver.max_t() > (int) strata::kernels::kVerifyMaxT;
+            gpu_only_arm(drive.d, drive.d.plan, refuse, split_windows, g.n_layers, g.n_expert, src.unbuffered(), gmode, &src);
             if (drive.d.gring != nullptr && !strata::core::gpu_only_ram_cache()) {
                 const uint64_t freed = src.stage_release();
                 std::fprintf(stderr, "strata serve: GPU-only misses: the start's stage buffers are freed (%.0f MiB)\n", (double) freed / 1048576.0);

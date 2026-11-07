@@ -4449,6 +4449,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    if (core::expert_trace_on()) {   // the GPU-only copy's trace: this chunk's routing of layer l (it stays on the GPU otherwise)
+                        cudaStreamSynchronize((cudaStream_t) m.cs);
+                        std::vector<int32_t> trace_ids((size_t) T * K);
+                        cudaMemcpy(trace_ids.data(), m.ids, trace_ids.size() * 4, cudaMemcpyDeviceToHost);
+                        core::expert_trace_routed(l, trace_ids.data(), T * K, m.g->n_expert, m.cache ? m.host_res : nullptr);
+                    }
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.

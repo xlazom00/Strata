@@ -3350,6 +3350,21 @@ int main(int argc, char** argv) {
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     strata::platform::restore_normal_io_priority();   // #4733: not the low disk priority of the program that started this one
+#if defined(STRATA_USE_HIP)
+    // STRATA_HIP_BLOCKING_SYNC=1 (opt-in): the HIP runtime's waits sleep.  By default a thread inside hipEventSynchronize /
+    // hipStreamSynchronize spins (amd::Event::awaitCompletion: SwitchToThread in a loop; hip::init sets the active wait and
+    // hipDeviceScheduleAuto keeps it), whatever the event's own blocking flag says; the prompt's 32 copy threads wait there.
+    // On an APU the spinning takes power from the GPU (Z13: C:\LLM\__BENCHMARKS\2026-11-10_hipdll-bisect).
+    if (const char* v = std::getenv("STRATA_HIP_BLOCKING_SYNC"); v != nullptr && v[0] == '1') {
+        int n_dev = 0, set = 0;
+        if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
+        for (int d = 0; d < n_dev; ++d)
+            if (cudaSetDevice(d) == cudaSuccess && hipSetDeviceFlags(hipDeviceScheduleBlockingSync) == cudaSuccess) ++set;
+        if (n_dev > 0) (void) cudaSetDevice(0);
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "strata: STRATA_HIP_BLOCKING_SYNC=1: the HIP runtime's waits sleep on %d of %d device(s)\n", set, n_dev);
+    }
+#endif
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
     {   // 0.2.1.2: hipblas / libhipblaslt / rocblas are delay-loaded (CMakeLists.txt) and live in <exe folder>\rocm\bin, which only the
         // launcher puts on PATH; make the folder part of this process's DLL search, so `strata.exe --version` run straight from the

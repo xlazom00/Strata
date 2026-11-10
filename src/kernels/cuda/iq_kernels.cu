@@ -1219,6 +1219,17 @@ template<> struct Split<20> {   // IQ4_NL
         const float d = r.dw * __low2float(bq8_1->ds);
         return d * sumi;
     }
+    __device__ static float apply_fma(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs, float acc) {
+        const int* q8 = (const int*) bq8_1->qs + iqs;
+        int sumi = 0;
+#pragma unroll
+        for (int l = 0; l < 2; ++l) {
+            sumi = ggml_cuda_dp4a(r.v[l].x, q8[l + 0], sumi);
+            sumi = ggml_cuda_dp4a(r.v[l].y, q8[l + 4], sumi);
+        }
+        const float d = r.dw * __low2float(bq8_1->ds);
+        return __fmaf_rn(d, (float) sumi, acc);
+    }
     // `apply` with the block's words in registers: p0 = words iqs, iqs + 1; p1 = words iqs + 4, iqs + 5; d8 = __low2float(ds)
     __device__ static float apply_u(const W& r, int2 p0, int2 p1, float d8) {
         int sumi = 0;
@@ -3789,8 +3800,9 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
 #pragma unroll
                     for (int c = 0; c < GRP_NC; ++c)
                         if (c < n) {
-                            const float v = Split<20>::apply(w[J], hbase + off[c] + kk[J] / 2, 2 * (kk[J] % 2));
-                            if (hh[J]) s[B::QB][c] += v; else s[B::QA][c] += v;
+                            // one explicit FMA for every entry (see Split<20>::apply_fma): the same rounding at every place of the chunk
+                            float& acc = hh[J] ? s[B::QB][c] : s[B::QA][c];
+                            acc = Split<20>::apply_fma(w[J], hbase + off[c] + kk[J] / 2, 2 * (kk[J] % 2), acc);
                         }
                 }(), ...);
             };

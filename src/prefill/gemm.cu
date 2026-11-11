@@ -201,6 +201,7 @@ struct HipLtState {
     hipblasLtHandle_t handle = nullptr;
     void* workspace = nullptr;
     size_t workspace_bytes = 0;
+    int version = 0;   // hipBLASLt's (hipblasLtGetVersion): solution IDs are scoped to it
     strata::prefill::hipblaslt::TuningTable table;
     std::map<HipLtCallKey, HipLtCachedAlgo> cache;
     uint64_t lt_launches = 0;
@@ -303,6 +304,7 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
         std::fprintf(stderr, "prefill gemm: hipBLASLt version query failed; using hipBLASEx\n");
         return nullptr;
     }
+    state->version = version;
     int device = 0;
     hipDeviceProp_t properties{};
     if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess) {
@@ -937,13 +939,19 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
     }
     // The kernel copies hipBLASLt solution 1176 / 1177's summation order, which is only true of the library build the
     // table was calibrated with: take it only when the table makes hipBLASLt pick one of those two for this T.
+    // Solution IDs are scoped to the hipBLASLt version: 1.5.0 (100500, ROCm 10.x) numbers the same two kernels 1253 / 1254
+    // (MT32x96x32 / MT96x96x32, the same tile parameters).  Z13 (gfx1151), T 2048 / 4096 / 8192 / 16384, X rows 10240 + 64:
+    // 0 of 0.66 M / 1.3 M / 2.6 M / 5.2 M outputs differ between this kernel and 1253, and between it and 1254, as with 1176 / 1177
+    // on 1.4.1; the kernel takes 4.17 ms at T 16384 where 1253 takes 6.45 and 1254 5.40 (C:\LLM\__BENCHMARKS\2026-11-10_hcd-exact-vs-hipblaslt).
+    auto* lt = static_cast<HipLtState*>(hipblaslt_state_);
+    const int same_a = lt->version >= 100500 ? 1253 : 1176, same_b = lt->version >= 100500 ? 1254 : 1177;
     const int id = hipblaslt_solution_for(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, T, N, K, N, 0.0f);
-    if (id != 1176 && id != 1177) {
+    if (lt->version > 100500 || (id != same_a && id != same_b)) {   // a newer hipBLASLt: not checked, so hipBLASLt runs it
         if (T >= 4096 && !told.exchange(true))   // (a short chunk may legitimately get another solution: not worth a line)
             std::fprintf(stderr, "strata: STRATA_HCD_EXACT: the tuning table gives the hyper-connection down projection (N 320, K 10240) "
-                                 "solution %d at T %lld, not 1176 / 1177: hipBLASLt runs it (a changed table or library; "
-                                 "tools/hip/gfx1151-hipblaslt-100401.txt is the one measured)\n",
-                         id, (long long) T);
+                                 "solution %d at T %lld, not %d / %d of hipBLASLt %d: hipBLASLt runs it (a changed table or library; "
+                                 "tools/hip/gfx1151-hipblaslt-100401.txt and -100500.txt are the ones measured)\n",
+                         id, (long long) T, same_a, same_b, lt->version);
         return false;
     }
     return strata_pf_hcdown_exact_bf16(X, ldx, W, Y, T, N, K, stream_);
